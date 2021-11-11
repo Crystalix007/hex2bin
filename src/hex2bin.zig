@@ -1,26 +1,25 @@
 const std = @import("std");
 
 fn usage() noreturn {
-    std.debug.warn("usage: INPUT.hex OUTPUT.bin\n");
+    std.log.warn("usage: INPUT.hex OUTPUT.bin\n", .{});
     std.os.exit(1);
 }
 
 pub fn main() !void {
     // we never free anything
-    var direct_allocator = std.heap.DirectAllocator.init();
-    var arena_allocator = std.heap.ArenaAllocator.init(&direct_allocator.allocator);
+    var arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = &arena_allocator.allocator;
 
-    var args = std.os.args();
+    var args = std.process.args();
     _ = try (args.next(allocator) orelse usage());
     const input_path_str = try (args.next(allocator) orelse usage());
     const output_path_str = try (args.next(allocator) orelse usage());
     if (args.next(allocator) != null) usage();
 
-    var input_file = try std.os.File.openRead(input_path_str);
+    var input_file = try std.fs.cwd().openFile(input_path_str, std.fs.File.OpenFlags{ .read = true });
     defer input_file.close();
 
-    var output_file = try std.os.File.openWrite(output_path_str);
+    var output_file = try std.fs.cwd().createFile(output_path_str, std.fs.File.CreateFlags{ .truncate = true });
     defer output_file.close();
 
     var translator: Translator = undefined;
@@ -28,19 +27,17 @@ pub fn main() !void {
     try translator.doIt();
 }
 
-const Translator = struct.{
+const Translator = struct {
     const Self = @This();
 
     input_path_str: []const u8,
-    input_file: *std.os.File,
-    input_file_stream: std.os.File.InStream,
-    buffered_input_stream: std.io.BufferedInStream(std.os.File.InStream.Error),
-    input: *std.io.InStream(std.os.File.InStream.Error),
+    input_file: *std.fs.File,
+    buffered_input_reader: std.io.BufferedReader(4096, std.fs.File.Reader),
+    input: std.io.BufferedReader(4096, std.fs.File.Reader).Reader,
 
-    output_file: *std.os.File,
-    output_file_stream: std.os.File.OutStream,
-    buffered_output_stream: std.io.BufferedOutStream(std.os.File.OutStream.Error),
-    output: *std.io.OutStream(std.os.File.OutStream.Error),
+    output_file: *std.fs.File,
+    buffered_output_writer: std.io.BufferedWriter(4096, std.fs.File.Writer),
+    output: std.io.BufferedWriter(4096, std.fs.File.Writer).Writer,
 
     allocator: *std.mem.Allocator,
     line_number: usize,
@@ -48,19 +45,17 @@ const Translator = struct.{
     output_cursor: usize,
     put_back: ?u8,
 
-    pub fn init(self: *Self, input_path_str: []const u8, input_file: *std.os.File, output_file: *std.os.File, allocator: *std.mem.Allocator) void {
+    pub fn init(self: *Self, input_path_str: []const u8, input_file: *std.fs.File, output_file: *std.fs.File, allocator: *std.mem.Allocator) void {
         // FIXME: return a new object once we have https://github.com/zig-lang/zig/issues/287
 
         self.input_path_str = input_path_str;
         self.input_file = input_file;
-        self.input_file_stream = self.input_file.inStream();
-        self.buffered_input_stream = std.io.BufferedInStream(std.os.File.InStream.Error).init(&self.input_file_stream.stream);
-        self.input = &self.buffered_input_stream.stream;
+        self.buffered_input_reader = std.io.bufferedReader(input_file.reader());
+        self.input = self.buffered_input_reader.reader();
 
         self.output_file = output_file;
-        self.output_file_stream = self.output_file.outStream();
-        self.buffered_output_stream = std.io.BufferedOutStream(std.os.File.OutStream.Error).init(&self.output_file_stream.stream);
-        self.output = &self.buffered_output_stream.stream;
+        self.buffered_output_writer = std.io.bufferedWriter(output_file.writer());
+        self.output = self.buffered_output_writer.writer();
 
         self.line_number = 1;
         self.column_number = 0;
@@ -69,7 +64,9 @@ const Translator = struct.{
     }
 
     pub fn doIt(self: *Self) !void {
-        defer self.buffered_output_stream.flush() catch {};
+        defer self.buffered_output_writer.flush() catch |err| {
+            std.log.warn("Failed to flush output: {any}\n", .{err});
+        };
         var too_close_for_nibble = false;
         while (true) {
             var c = self.readByte() catch |err| switch (err) {
@@ -85,8 +82,8 @@ const Translator = struct.{
                 // hex encoded byte
                 if (too_close_for_nibble) return self.parseError();
                 // next char must be the rest of the byte
-                const byteValue = (u8(nibble) << 4) |
-                    u8(parseNibble(self.readByte() catch '-') orelse return self.parseError());
+                const byteValue = (@intCast(u8, nibble) << 4) |
+                    @intCast(u8, parseNibble(self.readByte() catch '-') orelse return self.parseError());
                 try self.writeByte(byteValue);
                 // and then a char which is not a hex byte
                 too_close_for_nibble = true;
@@ -135,6 +132,7 @@ const Translator = struct.{
         self.column_number += 1;
         return b;
     }
+
     fn putBackByte(self: *Self, b: u8) void {
         std.debug.assert(self.put_back == null);
         self.put_back = b;
@@ -147,7 +145,7 @@ const Translator = struct.{
     }
 
     fn parseError(self: *Self) !void {
-        std.debug.warn("{}:{}:{}: error: parse error\n", self.input_path_str, self.line_number, self.column_number);
+        std.log.warn("{s}:{d}:{d}: error: parse error\n", .{ self.input_path_str, self.line_number, self.column_number });
         return error.ParseError;
     }
 
